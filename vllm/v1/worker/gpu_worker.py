@@ -11,7 +11,7 @@ from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from types import NoneType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import numpy as np
 import torch
@@ -67,6 +67,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.gpu_ffn_model_runner import GPUFFNModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -431,8 +432,11 @@ class Worker(WorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+        self.model_runner: GPUModelRunner | GPUFFNModelRunner | GPUModelRunnerV2
+        if self.vllm_config.afd_config and self.vllm_config.afd_config.is_ffn_server:
+            self.model_runner = GPUFFNModelRunner(self.vllm_config, self.device)
         # Construct the model runner
-        if self.use_v2_model_runner:
+        elif self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
             )
@@ -799,6 +803,10 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # FFN server mode: direct execution without pipeline parallelism
+        if self.vllm_config.afd_config and self.vllm_config.afd_config.is_ffn_server:
+            return self.model_runner.execute_model(scheduler_output)
+
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -949,6 +957,53 @@ class Worker(WorkerBase):
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
+
+    def start_ffn_server_loop(self) -> None:
+        """Start FFN server loop for AFD FFN workers"""
+        if not (
+            self.vllm_config.afd_config and self.vllm_config.afd_config.is_ffn_server
+        ):
+            return
+
+        self.model_runner.capture_model()
+        self.model_runner.initialize_afd_connector()
+
+        if self.profiler:
+            self.profiler.start()
+            for _ in range(1000):  # FIXME: hardcoded profiler iterations
+                self.model_runner.execute_model(scheduler_output=None)
+            torch.cuda.synchronize()  # Ensure GPU operations complete
+            self.profiler.stop()
+            print(self.profiler.key_averages().table(sort_by="self_cuda_time_total"))
+
+        import threading
+
+        self._ffn_shutdown_event = threading.Event()
+
+        def ffn_worker_loop():
+            # Set CUDA device for this thread (thread-local context)
+            torch.cuda.set_device(self.device)
+            logger.info("FFN worker loop started")
+
+            try:
+                while not self._ffn_shutdown_event.is_set():
+                    # Execute FFN computation
+                    self.model_runner.execute_model(scheduler_output=None)
+            except Exception as e:
+                logger.error("FFN worker loop error: %s", e)
+                raise
+
+        self._ffn_thread = threading.Thread(target=ffn_worker_loop, daemon=True)
+        self._ffn_thread.start()
+        logger.info("FFN server loop started in worker")
+
+    def stop_ffn_server_loop(self) -> None:
+        """Stop FFN server loop"""
+        if hasattr(self, "_ffn_shutdown_event"):
+            self._ffn_shutdown_event.set()
+            if hasattr(self, "_ffn_thread"):
+                self._ffn_thread.join(timeout=5)
+            logger.info("FFN server loop stopped")
 
     def _eplb_before_scale_down(self, old_ep_size: int, new_ep_size: int) -> None:
         from vllm.distributed.parallel_state import get_ep_group
