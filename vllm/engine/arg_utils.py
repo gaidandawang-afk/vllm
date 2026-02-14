@@ -1938,6 +1938,9 @@ class EngineArgs:
             ),
         )
 
+        if self.afd_config:
+            self.afd_config.init_afd_port = self.afd_config.afd_port
+
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,

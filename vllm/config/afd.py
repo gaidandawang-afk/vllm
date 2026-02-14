@@ -27,6 +27,9 @@ class AFDConfig:
     afd_port: int = 1239
     """Port number for stepmesh parameter server communication."""
 
+    init_afd_port: int = 1239
+    """Port number for stepmesh parameter server communication."""
+
     afd_host: str = "127.0.0.1"
     """Host address for stepmesh parameter server communication."""
 

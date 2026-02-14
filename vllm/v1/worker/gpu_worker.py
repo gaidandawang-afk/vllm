@@ -6,12 +6,12 @@ import gc
 import os
 from collections.abc import Callable
 import threading
-from collections.abc import Callable
-from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from types import NoneType
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast, Callable
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.weight_transfer import WeightTransferEngineFactory
 from vllm.logger import init_logger
@@ -73,6 +74,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from .utils import request_memory
+from ...distributed.afd_transfer import AFDConnectorFactory
 
 logger = init_logger(__name__)
 
@@ -452,9 +454,10 @@ class Worker(WorkerBase):
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
-        if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
-            report_usage_stats(self.vllm_config)
+        # debug
+        # if self.rank == 0:
+        #     # If usage stat is enabled, collect relevant info.
+        #     report_usage_stats(self.vllm_config)
 
         if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
             with set_current_vllm_config(self.vllm_config):
@@ -465,8 +468,17 @@ class Worker(WorkerBase):
                     self.distributed_init_method,
                     self.local_rank,
                 )
+            if self.vllm_config.afd_config and self.vllm_config.afd_config.is_attention_server:
+                def init_distributed_env_callback_with_afd(**kwargs):
+                    init_distributed_env_callback(**kwargs)
+                    self.model_runner.initialize_afd_connector()
+                reinit_callback = init_distributed_env_callback_with_afd
+            else:
+                reinit_callback = init_distributed_env_callback
 
             def clear_input_batch_callback():
+                if not hasattr(self.model_runner, "input_batch"):
+                    return
                 input_batch = self.model_runner.input_batch
                 cached_req_ids = input_batch.req_id_to_index.keys()
                 for req_id in list(cached_req_ids):
@@ -475,7 +487,7 @@ class Worker(WorkerBase):
             self.worker_sentinel = WorkerSentinel(
                 self.vllm_config,
                 self.model_runner.pause_event,
-                init_distributed_env_callback,
+                reinit_callback,
                 clear_input_batch_callback,
                 self.device,
             )
@@ -484,6 +496,8 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self) -> None:
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
+        if self.vllm_config.afd_config:
+            eep_scale_up = False
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -988,7 +1002,8 @@ class Worker(WorkerBase):
             try:
                 while not self._ffn_shutdown_event.is_set():
                     # Execute FFN computation
-                    self.model_runner.execute_model(scheduler_output=None)
+                    if "Exit" == self.model_runner.execute_model(scheduler_output=None):
+                        break
             except Exception as e:
                 logger.error("FFN worker loop error: %s", e)
                 raise
@@ -1197,7 +1212,7 @@ class Worker(WorkerBase):
             * get_tp_group().world_size
             * get_pp_group().world_size
         )
-        if new_ep_size < old_ep_size:
+        if not self.vllm_config.afd_config and new_ep_size < old_ep_size:
             self._eplb_before_scale_down(old_ep_size, new_ep_size)
 
         cleanup_dist_env_and_memory()
@@ -1219,6 +1234,24 @@ class Worker(WorkerBase):
                 self.distributed_init_method,
                 self.local_rank,
             )
+
+        # init AFD config
+        if self.vllm_config.afd_config:
+            self.vllm_config.afd_config.afd_port = self.vllm_config.afd_config.init_afd_port
+            self.vllm_config.afd_config.afd_port += 1
+            afd_size = reconfig_request.new_data_parallel_size
+            self.vllm_config.afd_config.afd_extra_config["afd_size"] = f"{afd_size}A{afd_size}F"
+
+            # init afd connector
+            self.model_runner.afd_connector = AFDConnectorFactory.create_connector(
+                get_world_group().rank, get_world_group().local_rank, self.vllm_config
+            )
+
+            if self.vllm_config.afd_config.is_ffn_server:
+                self.vllm_config.compilation_config.static_forward_context = dict()
+            else:
+                self.model_runner.afd_connector.init_afd_connector()
+            return
 
         global_expert_loads = self._reconfigure_moe(old_ep_size, new_ep_size)
 
@@ -1318,7 +1351,7 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-        if self.worker_sentinel is not None:
+        if not self.vllm_config.afd_config and self.worker_sentinel is not None:
             self.worker_sentinel.shutdown()
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +21,7 @@ from vllm.forward_context import set_forward_context, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.v1.engine.exceptions import EngineLoopPausedError
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ logger = init_logger(__name__)
 
 class GPUFFNModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        self.model = None
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.device = device
@@ -88,6 +90,13 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         else:
             self.num_layers = self.model_config.hf_config.num_hidden_layers
 
+        self.pause_event = threading.Event()
+
+    def _check_pause_event(self):
+        if self.pause_event.is_set():
+            raise EngineLoopPausedError("Worker is paused.")
+
+
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -100,14 +109,10 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             time_before_load = time.perf_counter()
             model_loader = get_model_loader(self.load_config)
 
-            if not hasattr(self, "model"):
-                logger.info("Loading model from scratch...")
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config, model_config=self.model_config
-                )
-            else:
-                logger.info("Model was already initialized. Loading weights inplace...")
-                model_loader.load_weights(self.model, model_config=self.model_config)
+            logger.info("Loading model from scratch...")
+            self.model = model_loader.load_model(
+                vllm_config=self.vllm_config, model_config=self.model_config
+            )
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
         logger.info(
@@ -147,6 +152,8 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     work.wait()
             # Try to use CUDA graph if available
             cuda_graph_info = self._find_cuda_graph(current_layer_idx, num_tokens)
+            self._check_pause_event()
+
             if cuda_graph_info is not None:
                 # Use captured CUDA graph for computation
                 with set_forward_context(
@@ -167,9 +174,12 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     )
 
             recv_metadata.recv_handle_list = None
+
+            self._check_pause_event()
             self.connector.send_ffn_output(rank_ffn_output, recv_metadata)
         except Exception as e:
-            raise ValueError(f"Error computing FFN: {e}") from e
+            logger.warning(f"Error computing FFN: {e}")
+            return "Exit"
         finally:
             self._counter += 1
             if self._counter == self.num_layers * self.afd_config.num_afd_stages:
@@ -252,6 +262,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
     def _dummy_run(self, num_tokens: int = 1, **kwargs) -> torch.Tensor:
         """FFN servers don't need dummy runs."""
         # Return a dummy tensor for interface compatibility
+        self._check_pause_event()
         return torch.zeros(
             num_tokens,
             self.model_config.hf_config.hidden_size,

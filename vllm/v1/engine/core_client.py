@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
+from copy import deepcopy
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, TypeAlias, TypeVar, cast
@@ -51,10 +52,10 @@ from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError, FaultInfo
 from vllm.v1.engine.utils import (
-    CoreEngineActorManager,
+    GlobalActorManager,
     CoreEngineProcManager,
     launch_core_engines,
-    serialize_method_call,
+    serialize_method_call, generate_identity_group, CoreEngineActorManager,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -577,8 +578,8 @@ class BackgroundResources:
 
     ctx: zmq.Context
     # If CoreEngineProcManager, it manages local engines;
-    # if CoreEngineActorManager, it manages all engines.
-    engine_manager: CoreEngineProcManager | CoreEngineActorManager | None = None
+    # if GlobalActorManager, it manages all engines.
+    engine_manager: CoreEngineProcManager | GlobalActorManager | None = None
     coordinator: DPCoordinator | None = None
     output_socket: zmq.Socket | zmq.asyncio.Socket | None = None
     input_socket: zmq.Socket | zmq.asyncio.Socket | None = None
@@ -728,6 +729,7 @@ class MPClient(EngineCoreClient):
             self.input_socket = self.resources.input_socket = make_zmq_socket(
                 self.ctx, input_address, zmq.ROUTER, bind=True
             )
+            self.input_socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
             self.resources.output_socket = make_zmq_socket(
                 self.ctx, output_address, zmq.PULL
             )
@@ -764,7 +766,8 @@ class MPClient(EngineCoreClient):
                         "initial message on input socket."
                     )
                 identity, _ = sync_input_socket.recv_multipart()
-                identities.remove(identity)
+                if identity.find(b'FFN') == -1:
+                    identities.remove(identity)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
@@ -839,7 +842,7 @@ class MPClient(EngineCoreClient):
         return self.engines_running
 
     def start_engine_core_actor_monitor(self):
-        engine_manager = self.resources.engine_manager
+        engine_manager: CoreEngineActorManager = self.resources.engine_manager.managers["CoreEngineActorManager"]
         if (
             not isinstance(engine_manager, CoreEngineActorManager)
             or not self.vllm_config.fault_tolerance_config.enable_fault_tolerance
@@ -863,6 +866,7 @@ class MPClient(EngineCoreClient):
                         ) + len(engine_manager.local_engine_actors)
                     else:
                         logger.error("Unknown actor (ID: %s)", actor_id)
+                        all_actors.remove(actor)
                         continue
 
                     actor_info = get_actor(actor_id)
@@ -1458,6 +1462,10 @@ class DPAsyncMPClient(AsyncMPClient):
                                 ("SCALE_ELASTIC_EP", new_engine_count)
                             )
                             await socket.send(scale_msg)
+                            nonlocal count_slice
+                            count_slice = slice(
+                                self.engine_ranks_managed[0], self.engine_ranks_managed[-1] + 1
+                            )
                             continue
 
                         # we're sending a request while the engines are
@@ -1651,26 +1659,70 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Phase 1: Send reconfigure messages to all existing engines and wait
         # for them to be sent
         reconfig_futures = []
+        def add_futures(engine_list: list[EngineIdentity], request: ReconfigureDistributedRequest) -> None:
+            for engine in engine_list:
+                coro = self._call_utility_async(
+                    "reinitialize_distributed", deepcopy(request), engine=engine
+                )
+                reconfig_futures.append(asyncio.create_task(coro))
         self.vllm_config.parallel_config.data_parallel_master_port = get_open_port()
-        for engine in self.core_engines:
-            reconfig_request = ReconfigureDistributedRequest(
-                new_data_parallel_size=new_data_parallel_size,
-                new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
-                new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
-                new_data_parallel_master_ip=self.vllm_config.parallel_config.data_parallel_master_ip,
-                new_data_parallel_master_port=self.vllm_config.parallel_config.data_parallel_master_port,
-            )
-            coro = self._call_utility_async(
-                "reinitialize_distributed", reconfig_request, engine=engine
-            )
-            reconfig_futures.append(asyncio.create_task(coro))
+        reconfig_request = ReconfigureDistributedRequest(
+            new_data_parallel_size=new_data_parallel_size,
+            new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_master_ip=self.vllm_config.parallel_config.data_parallel_master_ip,
+            new_data_parallel_master_port=self.vllm_config.parallel_config.data_parallel_master_port,
+        )
+        add_futures(self.core_engines, deepcopy(reconfig_request))
 
-        logger.info("All reconfigure messages sent, starting engine creation")
+        if self.vllm_config.afd_config:
+            ffn_engines = self.resources.engine_manager.managers["FFNActorManager"].get_identities()
+            ffn_reconfig_request = deepcopy(reconfig_request)
+            ffn_reconfig_request.new_data_parallel_master_ip = self.resources.engine_manager.managers["FFNActorManager"].ep_master_ip
+            add_futures(ffn_engines, ffn_reconfig_request)
+
+        # it seems that _call_utility_async won't actually run "reinitialize_distributed" without sleep(0).
+        await asyncio.sleep(0)
+        logger.info(f"All reconfigure messages sent, starting engine creation, {len(self.core_engines)=}")
+
+        # sentinel scale up
+        logger.info(
+            f"iwslog client sentinel indexer Before scale up, {self.engine_registry=}, {self.client_sentinel.engine_identity_to_index=}")
+        if not self.vllm_config.afd_config:
+            identity_group = generate_identity_group(
+                peer1="client",
+                peer2="engine_core_sentinel",
+                use="report and cmd",
+                n=new_data_parallel_size,
+            )
+            for i in range(cur_data_parallel_size, new_data_parallel_size):
+                self.engine_registry[i] = identity_group[i]
+                self.client_sentinel.engine_identity_to_index[self.engine_registry[i]] = i
+        else:
+            # move old slots
+            new_slot_start_index = new_data_parallel_size + cur_data_parallel_size - 1
+            for i in range(cur_data_parallel_size * 2 - 1, cur_data_parallel_size - 1, -1):
+                self.engine_registry[new_slot_start_index] = self.engine_registry[i]
+                self.client_sentinel.engine_identity_to_index[self.engine_registry[i]] = new_slot_start_index
+                new_slot_start_index -= 1
+            # add new identities
+            identity_group = generate_identity_group(
+                peer1="client",
+                peer2="engine_core_sentinel",
+                use="report and cmd",
+                n=(new_data_parallel_size - cur_data_parallel_size) * 2,  # assert size_A == size_F
+            )
+            for i in range(cur_data_parallel_size, new_data_parallel_size):
+                self.engine_registry[i] = identity_group.pop()
+                self.client_sentinel.engine_identity_to_index[self.engine_registry[i]] = i
+                ffn_i = i + new_data_parallel_size
+                self.engine_registry[ffn_i] = identity_group.pop()
+                self.client_sentinel.engine_identity_to_index[self.engine_registry[ffn_i]] = ffn_i
 
         # Phase 2: Create new engines now that reconfig messages have been sent
         # self.resources.engine_manager is guaranteed to be
-        # CoreEngineActorManager for RayDPClient
-        assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
+        # GlobalActorManager for RayDPClient
+        assert isinstance(self.resources.engine_manager, GlobalActorManager)
         self.resources.engine_manager.scale_up_elastic_ep(
             self.vllm_config, new_data_parallel_size
         )
@@ -1681,6 +1733,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             new_engine = i.to_bytes(2, "little")
             self.core_engines.append(new_engine)
             new_engine_identities.add(new_engine)
+
+        # update engine_ranks_managed
+        self.engine_ranks_managed = list(range(new_data_parallel_size))
 
         # Wait for ready messages from new engines on the input socket
         sync_input_socket = zmq.Socket.shadow(self.input_socket)
@@ -1724,32 +1779,65 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.vllm_config.parallel_config.data_parallel_master_port = get_open_port()
 
         reconfig_futures = []
-        for cur_dp_rank, engine in enumerate(self.core_engines):
-            reconfig_request = ReconfigureDistributedRequest(
-                new_data_parallel_size=new_data_parallel_size,
-                new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
-                new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
-                new_data_parallel_master_ip=self.vllm_config.parallel_config.data_parallel_master_ip,
-                new_data_parallel_master_port=self.vllm_config.parallel_config.data_parallel_master_port,
-            )
-            if cur_dp_rank >= new_data_parallel_size:
-                reconfig_request.new_data_parallel_rank = (
-                    ReconfigureRankType.SHUTDOWN_CURRENT_RANK
-                )
-            coro = self._call_utility_async(
-                "reinitialize_distributed", reconfig_request, engine=engine
-            )
-            reconfig_futures.append(asyncio.create_task(coro))
+        def add_futures(engine_list: list[EngineIdentity], request: ReconfigureDistributedRequest) -> None:
+            for cur_dp_rank, engine in enumerate(engine_list):
+                req = deepcopy(request)
+                if cur_dp_rank >= new_data_parallel_size:
+                    req.new_data_parallel_rank = (
+                        ReconfigureRankType.SHUTDOWN_CURRENT_RANK
+                    )
+                coro = self._call_utility_async("reinitialize_distributed", req, engine=engine)
+                task = asyncio.create_task(coro)
+                if cur_dp_rank < new_data_parallel_size:
+                    reconfig_futures.append(task)
+        reconfig_request = ReconfigureDistributedRequest(
+            new_data_parallel_size=new_data_parallel_size,
+            new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
+            new_data_parallel_master_ip=self.vllm_config.parallel_config.data_parallel_master_ip,
+            new_data_parallel_master_port=self.vllm_config.parallel_config.data_parallel_master_port,
+        )
+        add_futures(self.core_engines, deepcopy(reconfig_request))
+
+        if self.vllm_config.afd_config:
+            ffn_engines = self.resources.engine_manager.managers["FFNActorManager"].get_identities()
+            ffn_reconfig_request = deepcopy(reconfig_request)
+            ffn_reconfig_request.new_data_parallel_master_ip = self.resources.engine_manager.managers["FFNActorManager"].ep_master_ip
+            add_futures(ffn_engines, ffn_reconfig_request)
 
         for _ in range(new_data_parallel_size, cur_data_parallel_size):
             self.core_engines.pop()
 
-        await asyncio.gather(*reconfig_futures)
+        await asyncio.sleep(0)
+        logger.info(f"All reconfigure messages sent, starting engine shutdown, {len(self.core_engines)=}")
 
-        assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
+        # sentinel scale down
+        logger.info(
+            f"iwslog client sentinel indexer Before scale down, {self.engine_registry=}, {self.client_sentinel.engine_identity_to_index=}")
+        if self.vllm_config.afd_config:
+            # move old slots and clean descaled slots.
+            # slots to move [cur_data_parallel_size, cur_data_parallel_size + new_data_parallel_size]
+            new_slot_start_index = new_data_parallel_size
+            for i in range(new_data_parallel_size, cur_data_parallel_size * 2):
+                if new_data_parallel_size <= i < cur_data_parallel_size or new_data_parallel_size <= (
+                        i - cur_data_parallel_size) < cur_data_parallel_size:
+                    del self.client_sentinel.engine_identity_to_index[self.engine_registry[i]]
+                    del self.engine_registry[i]
+                    continue
+                self.engine_registry[new_slot_start_index] = self.engine_registry[i]
+                self.client_sentinel.engine_identity_to_index[self.engine_registry[i]] = new_slot_start_index
+                new_slot_start_index += 1
+
+        logger.info(
+            f"iwslog client sentinel indexer After scale down, {self.engine_registry=}, {self.client_sentinel.engine_identity_to_index=}")
+
+        assert isinstance(self.resources.engine_manager, GlobalActorManager)
+        await asyncio.gather(*reconfig_futures)
         self.resources.engine_manager.scale_down_elastic_ep(
             cur_data_parallel_size, new_data_parallel_size
         )
+        # update engine_ranks_managed before _ensure_stats_update_task
+        self.engine_ranks_managed = list(range(new_data_parallel_size))
 
         self._ensure_stats_update_task()
         scale_down_marker = msgspec.msgpack.encode(

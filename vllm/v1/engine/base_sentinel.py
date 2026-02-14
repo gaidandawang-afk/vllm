@@ -43,6 +43,7 @@ class BaseSentinel:
         sentinel_tag: str | None,
         fault_tolerance_config: FaultToleranceConfig,
     ):
+        self.identity = dealer_socket_identity
         self.sentinel_dead = False
         self.ctx = zmq.Context()
         self.sentinel_tag = sentinel_tag
