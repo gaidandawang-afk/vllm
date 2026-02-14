@@ -246,7 +246,10 @@ class EngineCoreSentinel(BaseSentinel):
         start_time = time.monotonic()
         identities = self._get_target_worker_identity()
         success, _ = self._broadcast_command_to_downstream(
-            "retry", identities, timeout=timeout
+            "retry",
+            identities,
+            timeout=timeout,
+            response_timeout=timeout,
         )
         if not success:
             return success
@@ -310,12 +313,13 @@ def busy_loop_wrapper(busy_loop_func):
 
                     # Put running requests into waiting list.
                     timestamp = time.monotonic()
-                    while self.scheduler.running:
-                        request = self.scheduler.running.pop()
-                        self.scheduler.preempt_request(request, timestamp)
-                    self.scheduler.prev_step_scheduled_req_ids.clear()
-                    if self.batch_queue is not None:
-                        self.batch_queue.clear()
+                    if hasattr(self, "scheduler") and self.scheduler is not None:
+                        while self.scheduler.running:
+                            request = self.scheduler.running.pop()
+                            self.scheduler.preempt_request(request, timestamp)
+                        self.scheduler.prev_step_scheduled_req_ids.clear()
+                        if self.batch_queue is not None:
+                            self.batch_queue.clear()
 
                     try:
                         # Block until recovery command received
@@ -763,7 +767,8 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
-        self.structured_output_manager.clear_backend()
+        if self.structured_output_manager:
+            self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
@@ -881,7 +886,10 @@ class EngineCoreProc(EngineCore):
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         self.afd_config = vllm_config.afd_config
         self.engine_index = engine_index
-        identity = self.engine_index.to_bytes(length=2, byteorder="little")
+        if self.afd_config.is_ffn_server:
+            identity = f"FFN_{self.engine_index}".encode("utf-8")
+        else:
+            identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
 
         with self._perform_handshakes(
@@ -927,8 +935,14 @@ class EngineCoreProc(EngineCore):
                 assert addresses.client_cmd_addr is not None
                 # The ZMQ address between engine_core_sentinel and worker_sentinel.
                 worker_cmd_addr = get_engine_client_zmq_addr(True, "0.0.0.0")
+
+                # LOCAL ffn sentinel identities start from dp_size
+                sentinel_index = self.engine_index
+                if vllm_config.afd_config and vllm_config.afd_config.is_ffn_server:
+                    sentinel_index += vllm_config.parallel_config.data_parallel_size
+
                 self.engine_core_sentinel = EngineCoreSentinel(
-                    engine_index=self.engine_index,
+                    engine_index=sentinel_index,
                     fault_signal_q=self.fault_signal_q,
                     cmd_q=self.cmd_q,
                     busy_loop_active=self.busy_loop_active,
@@ -936,7 +950,7 @@ class EngineCoreProc(EngineCore):
                     engine_fault_socket_addr=addresses.engine_fault_socket_addr,
                     client_cmd_addr=addresses.client_cmd_addr,
                     worker_cmd_addr=worker_cmd_addr,
-                    dealer_socket_identity=engine_core_sentinel_ids[self.engine_index],
+                    dealer_socket_identity=engine_core_sentinel_ids[sentinel_index],
                     tp_size=vllm_config.parallel_config.tensor_parallel_size,
                     pp_size=vllm_config.parallel_config.pipeline_parallel_size,
                     dp_size=vllm_config.parallel_config.data_parallel_size,
@@ -945,7 +959,7 @@ class EngineCoreProc(EngineCore):
                 vllm_config.fault_tolerance_config.worker_cmd_addr = worker_cmd_addr
                 # Do not shut down the engine immediately upon failure.
                 executor_fail_callback = lambda: self.fault_signal_q.put(
-                    RuntimeError(f"Executor on EngineCore {self.engine_index} failed.")
+                    RuntimeError(f"Executor on EngineCore {sentinel_index} failed.")
                 )
             else:
                 executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -1197,23 +1211,6 @@ class EngineCoreProc(EngineCore):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
 
-        if self.afd_config and self.afd_config.afd_role == "ffn":
-            logger.info("AFD FFN Server started, workers running...")
-            try:
-                # Tell workers to start FFN server loops (one-time call)
-                self.model_executor.collective_rpc("start_ffn_server_loop")
-
-                # Main thread waits without busy polling
-                shutdown_event = threading.Event()
-                shutdown_event.wait()  # Block until interrupted
-
-            except KeyboardInterrupt:
-                logger.info("Server shutting down...")
-                self.model_executor.collective_rpc("stop_ffn_server_loop")
-            except Exception as e:
-                logger.error("Server error: %s", e)
-                raise
-
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
             # 1) Poll the input queue until there is work to do.
@@ -1233,7 +1230,7 @@ class EngineCoreProc(EngineCore):
         waited = False
         while (
             not self.engines_running
-            and not self.scheduler.has_requests()
+            and (not self.scheduler or not self.scheduler.has_requests())
             and not self.batch_queue
         ):
             if self.input_queue.empty():
@@ -1279,6 +1276,14 @@ class EngineCoreProc(EngineCore):
     ) -> None:
         """Dispatch request from client."""
 
+        if self.vllm_config.afd_config.is_ffn_server:
+            concerned = self._concerned_requests_filter(request_type, request)
+            if not concerned:
+                logger.warning(
+                    "Unconcerned input request type encountered: %s", request_type
+                )
+                return
+
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
             self.add_request(req, request_wave)
@@ -1307,6 +1312,19 @@ class EngineCoreProc(EngineCore):
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+
+    @staticmethod
+    def _concerned_requests_filter(request_type: EngineCoreRequestType, request: Any):
+        if request_type not in {EngineCoreRequestType.UTILITY, EngineCoreRequestType.PAUSE,
+                                EngineCoreRequestType.EXECUTOR_FAILED}:
+            return False
+
+        if request_type == EngineCoreRequestType.UTILITY:
+            _, _, method_name, _ = request
+            if method_name != "reinitialize_distributed":
+                return False
+
+        return True
 
     @staticmethod
     def _convert_msgspec_args(method, args):
@@ -1387,7 +1405,8 @@ class EngineCoreProc(EngineCore):
 
             if coord_socket is not None:
                 # Wait for ready message from coordinator.
-                assert coord_socket.recv() == b"READY"
+                if not os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1":
+                   assert coord_socket.recv() == b"READY"
                 poller.register(coord_socket, zmq.POLLIN)
 
             ready_event.set()
@@ -1516,7 +1535,7 @@ class EngineCoreProc(EngineCore):
 
     def shutdown(self):
         super().shutdown()
-        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance:
+        if self.vllm_config.fault_tolerance_config.enable_fault_tolerance and not self.vllm_config.afd_config:
             self.engine_core_sentinel.shutdown()
 
 
@@ -1627,22 +1646,6 @@ class DPEngineCoreProc(EngineCoreProc):
     @busy_loop_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
-        if self.afd_config and self.afd_config.afd_role == "ffn":
-            logger.info("AFD FFN Server started, workers running...")
-            try:
-                # Tell workers to start FFN server loops (one-time call)
-                self.model_executor.collective_rpc("start_ffn_server_loop")
-
-                # Main thread waits without busy polling
-                shutdown_event = threading.Event()
-                shutdown_event.wait()  # Block until interrupted
-
-            except KeyboardInterrupt:
-                logger.info("Server shutting down...")
-                self.model_executor.collective_rpc("stop_ffn_server_loop")
-            except Exception as e:
-                logger.error("Server error: %s", e)
-                raise
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
@@ -1707,16 +1710,22 @@ class DPEngineCoreProc(EngineCoreProc):
             dp_init_port=new_stateless_dp_group_port,
         )
         self.step_counter = 0
+        # ffn restart loop and init afd_connector
+        if hasattr(self, "restart_running_loop"):
+            self.restart_running_loop()
+        logger.info(f"iwslog reinit_dp_group_on_fault_tolerance SUCCESS")
 
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
     ) -> None:
         stateless_destroy_torch_distributed_process_group(self.dp_group)
-        self.shutdown()
-
+        if not self.afd_config or self.afd_config.is_attention_server:
+            self.shutdown()
         parallel_config = self.vllm_config.parallel_config
         old_dp_size = parallel_config.data_parallel_size
         parallel_config.data_parallel_size = reconfig_request.new_data_parallel_size
+        if parallel_config.multi_level_index >= 0:  # temp code for loop scaling
+            parallel_config.multi_level_index = 0
         if reconfig_request.new_data_parallel_rank != -1:
             parallel_config.data_parallel_rank = reconfig_request.new_data_parallel_rank
         # local rank specifies device visibility, it should not be changed
@@ -1738,6 +1747,12 @@ class DPEngineCoreProc(EngineCoreProc):
         )
 
         self.model_executor.reinitialize_distributed(reconfig_request)
+        if self.afd_config and self.afd_config.is_ffn_server:
+            logger.info(
+                "Distributed environment reinitialized for FFN DP rank %s", self.dp_rank
+            )
+            return
+
         if reconfig_request.new_data_parallel_size > old_dp_size:
             assert self.available_gpu_memory_for_kv_cache > 0
             # pass available_gpu_memory_for_kv_cache from existing
@@ -1870,3 +1885,78 @@ class DPEngineCoreActor(DPEngineCoreProc):
             raise
         finally:
             self.shutdown()
+
+
+class FFNActor(DPEngineCoreActor):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        local_client: bool,
+        addresses: EngineZmqAddresses,
+        executor_class: type[Executor],
+        log_stats: bool,
+        dp_rank: int = 0,
+        local_dp_rank: int = 0,
+    ):
+        # to fix missing attributes during FFN engine core initialization
+        self.scheduler = None
+        self.batch_queue = None
+        self.aborts_queue = queue.Queue[list[str]]()
+
+        self.is_ffn_active = True
+        import threading
+        self._restart_ffn_event = threading.Event()
+
+        # FFN poll nothing from coordinator
+        addresses.coordinator_input = None
+        addresses.coordinator_output = None
+
+        super().__init__(vllm_config, local_client, addresses, executor_class, log_stats, dp_rank, local_dp_rank)
+
+    def run(self):
+        """
+        Run the ffn server loop and engine core busy loop.
+        """
+        try:
+            threading.Thread(target=self.run_ffn_task).start()
+            self.run_busy_loop()
+        except SystemExit:
+            logger.debug("EngineCore exiting.")
+            raise
+        except Exception:
+            logger.exception("EngineCore encountered a fatal error.")
+            raise
+        finally:
+            self.shutdown()
+
+
+    def run_ffn_task(self):
+        """
+        Run the busy loop.
+        """
+        logger.info("AFD FFN Server started, workers running...")
+        try:
+            while self.is_ffn_active:
+                self.model_executor.collective_rpc("start_ffn_server_loop")
+                self._restart_ffn_event.wait()
+                self._restart_ffn_event.clear()
+                logger.info("Restart FFN loop now")
+        except KeyboardInterrupt:
+            logger.info("Server shutting down...")
+            self.model_executor.collective_rpc("stop_ffn_server_loop")
+        except Exception as e:
+            logger.error("Server error: %s", e)
+            raise
+
+    def reinitialize_distributed(
+        self, reconfig_request: ReconfigureDistributedRequest
+    ) -> None:
+        self.model_executor.collective_rpc("stop_ffn_server_loop")
+        super().reinitialize_distributed(reconfig_request)
+        to_shutdown = reconfig_request.new_data_parallel_rank == ReconfigureRankType.SHUTDOWN_CURRENT_RANK
+        self.restart_running_loop(to_shutdown)
+
+    def restart_running_loop(self, to_shutdown = False):
+        if to_shutdown:
+            self.is_ffn_active = False
+        self._restart_ffn_event.set()

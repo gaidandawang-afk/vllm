@@ -85,7 +85,7 @@ class P2PAFDConnector(AFDConnectorBase):
             world_size=ffn_size + attn_size,
             rank=world_rank,
             group_name="afd",
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=5),
         )
 
         # Construct rank lists for sub groups.
@@ -119,6 +119,7 @@ class P2PAFDConnector(AFDConnectorBase):
                 group_name="e2a",
             )
 
+        self.config.afd_config.afd_port += 10
         self._initialized = True
 
     def is_initialized(self) -> bool:

@@ -229,6 +229,11 @@ class ParallelConfig:
     Set to be private as it's not intended to be configured by users.
     """
 
+    multi_level_index: int = 0
+    """Offset to reuse dp port for data parallel messaging for scaling. 
+    Set it -1 to disable this feature.
+    """
+
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size
@@ -344,6 +349,14 @@ class ParallelConfig:
         initialize a new process group related to data parallelism.
         """
         if self._data_parallel_master_port_list:
+            # temp code for loop scaling
+            if self.multi_level_index >= 0:
+                level_offset = (self.data_parallel_size.bit_length() - 2) << 1
+                level_key = (level_offset + self.multi_level_index) % len(
+                    self._data_parallel_master_port_list
+                )
+                self.multi_level_index += 1
+                return self._data_parallel_master_port_list[level_key]
             answer = self._data_parallel_master_port_list.pop()
         else:
             answer = self.data_parallel_master_port

@@ -338,16 +338,17 @@ class GroupCoordinator:
         options = None
         if torch_distributed_backend == "nccl":
             options = torch._C._distributed_c10d.ProcessGroupNCCL.Options()
-            if (
-                fault_tolerance_config is not None
-                and fault_tolerance_config.enable_fault_tolerance
-            ):
-                gloo_comm_timeout = timedelta(
-                    seconds=fault_tolerance_config.gloo_comm_timeout
-                )
-                # need to set communicators as nonblocking to abort safely
-                options.config.blocking = 0
-                os.environ["NCCL_COMM_BLOCKING"] = "0"
+            # debug
+            # if (
+            #     fault_tolerance_config is not None
+            #     and fault_tolerance_config.enable_fault_tolerance
+            # ):
+            #     gloo_comm_timeout = timedelta(
+            #         seconds=fault_tolerance_config.gloo_comm_timeout
+            #     )
+            #     # need to set communicators as nonblocking to abort safely
+            #     options.config.blocking = 0
+            #     os.environ["NCCL_COMM_BLOCKING"] = "0"
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
