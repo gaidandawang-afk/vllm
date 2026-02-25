@@ -4,11 +4,13 @@
 
 import gc
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION
 from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from types import NoneType
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast, Callable
 
 import numpy as np
 import torch

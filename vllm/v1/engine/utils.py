@@ -400,7 +400,7 @@ class FFNActorManager(BaseActorManager):
         self.actors: list[ray.ActorHandle] = []
         self.run_refs: list[ray.ObjectRef] = []
 
-        afd_size = self.config.afd_config.afd_extra_config.get("afd_size")
+        afd_size = self.vllm_config.afd_config.afd_extra_config.get("afd_size")
         attn_size, ffn_size = map(int, re.match(r"(\d+)\D+(\d+)", afd_size).groups())
         assert  attn_size == vllm_config.parallel_config.data_parallel_size
         self.ffn_size = ffn_size
@@ -1048,7 +1048,7 @@ class CoreEngineActorManager(BaseActorManager):
         from vllm.v1.engine.core import DPEngineCoreActor
         return  (
             DPEngineCoreActor
-            if vllm_config.parallel_config.data_parallel_size > 1 and vllm_config.model_config.is_moe
+            if vllm_config.parallel_config.data_parallel_size > 1 # and vllm_config.model_config.is_moe
             else DPEngineCoreActor
         )
 
