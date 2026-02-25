@@ -663,7 +663,7 @@ class FFNActorManager(BaseActorManager):
 
         with BaseActorManager._pg_create_lock:
             placement_groups, local_dp_ranks = FFNActorManager.add_ep_placement_groups(
-                self.vllm_config, new_data_parallel_size
+                cur_vllm_config, new_data_parallel_size
             )
             ray.get([pg.ready() for pg in placement_groups])
         logger.info(f"FFN add placement_groups={[len(pg.bundle_specs) for pg in placement_groups]}, {local_dp_ranks=}")
