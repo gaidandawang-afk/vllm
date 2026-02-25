@@ -1429,7 +1429,7 @@ class DPAsyncMPClient(AsyncMPClient):
                             )
                             await socket.send(scale_msg)
                             nonlocal count_slice
-                            count_slice = (
+                            count_slice = slice(
                                 self.engine_ranks_managed[0], self.engine_ranks_managed[-1] + 1
                             )
                             continue
